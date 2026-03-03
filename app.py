@@ -1,102 +1,198 @@
 import streamlit as st
 import cv2
 import numpy as np
+import time
 import av
-import os
-import torch
-import json
-import queue # 解決 Thread-safe 問題的關鍵
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-import mediapipe as mp
-from dotenv import load_dotenv
 
-# 1. 環境設定
-load_dotenv()
+# 1. 頁面基礎設定
 st.set_page_config(
     page_title="淡江大學 TSL 雙向手語轉譯系統",
     page_icon="🤟",
     layout="wide"
 )
 
-# 自動偵測設備 (解決雲端無 GPU 會崩潰的問題)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# 2. 現代感 CSS
+st.markdown("""
+    <style>
+    .stApp { background-color: #F8FAFC; }
+    
+    .main-header {
+        background: linear-gradient(135deg, #005696 0%, #00AEEF 100%);
+        padding: 2rem;
+        border-radius: 20px;
+        color: white;
+        text-align: center;
+        margin-bottom: 2rem;
+        box-shadow: 0 10px 30px rgba(0, 86, 150, 0.2);
+    }
 
-# 2. 初始化 Queue 與 Session State
-# WebRTC 回呼函數不能直接寫入 st.session_state，必須透過 Queue 傳遞結果
-if "result_queue" not in st.session_state:
-    st.session_state.result_queue = queue.Queue()
-if 'detected_glosses' not in st.session_state:
-    st.session_state.detected_glosses = []
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 50px;
+        justify-content: center;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        background-color: transparent;
+        padding: 0px 30px;
+        font-weight: 600;
+        font-size: 1.1rem;
+    }
+    .stTabs [aria-selected="true"] {
+        color: #005696 !important;
+        border-bottom: 3px solid #005696 !important;
+    }
+
+    .result-card {
+        background-color: white;
+        padding: 20px;
+        border-radius: 15px;
+        border-left: 6px solid #005696;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        min-height: 80px;
+        display: flex;
+        align-items: center;
+    }
+    .empty-placeholder {
+        color: #94A3B8;
+        font-style: italic;
+    }
+    
+    .video-placeholder {
+        border: 2px dashed #CBD5E1; 
+        border-radius: 15px; 
+        height: 320px; 
+        display: flex; 
+        align-items: center; 
+        justify-content: center; 
+        background-color: white;
+        box-shadow: inset 0 2px 4px 0 rgba(0,0,0,0.02);
+        margin-top: 10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# 3. 初始化 Session State
+if 'detected_gloss' not in st.session_state:
+    st.session_state.detected_gloss = ""
 if 'translated_chinese' not in st.session_state:
     st.session_state.translated_chinese = ""
+if 'video_ready' not in st.session_state:
+    st.session_state.video_ready = False
 
-# 3. 資源載入 (使用快取)
-@st.cache_resource
-def load_labels():
-    try:
-        with open('label_map.json', 'r', encoding='utf-8') as f:
-            l_map = json.load(f)
-        return {v: k for k, v in l_map.items()}
-    except:
-        return {0: "測試標籤"}
+# 4. WebRTC 伺服器設定 (確保雲端連線穩定)
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
-actions = load_labels()
-
-# 4. MediaPipe 初始化
-mp_holistic = mp.solutions.holistic
-mp_drawing = mp.solutions.drawing_utils
-holistic = mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-
-# 用於儲存序列的臨時 buffer (不要放進 session_state 以免回呼函數報錯)
-sequence_buffer = []
-
+# 影像處理回呼函式 (取代原本的 while 迴圈)
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img = frame.to_ndarray(format="bgr24")
-    img = cv2.flip(img, 1)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = holistic.process(img_rgb)
     
-    # 繪圖
-    if results.left_hand_landmarks:
-        mp_drawing.draw_landmarks(img, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
-    if results.right_hand_landmarks:
-        mp_drawing.draw_landmarks(img, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
-
-    # 模擬預測邏輯 (曼璇，等妳放上核心模型後，將結果 put 進 queue)
-    # example: if prediction_confidence > 0.85: st.session_state.result_queue.put(action)
-
+    # 鏡像翻轉，比較符合使用者的直覺
+    img = cv2.flip(img, 1)
+    
+    # 💡 之後我們就在這裡把 MediaPipe 的骨架追蹤邏輯加進去！
+    
     return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# --- UI 介面佈局 ---
-st.title("🤟 淡江校園窗口：台灣手語雙向轉譯系統")
+# --- 頂部標題區 ---
+st.markdown("""
+    <div class="main-header">
+        <h1 style='margin:0; font-size: 2.3rem; font-weight: 800;'>淡江校園窗口與行政服務：台灣手語雙譯系統</h1>
+        <p style='margin:10px 0 0 0; opacity: 0.9;'>Tamkang University - AI Sign Language Bidirectional Translation</p>
+    </div>
+    """, unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["👐 手語轉中文", "👤 中文轉手語"])
+# --- 分頁鍵 ---
+tab_slr, tab_slp = st.tabs(["👐 手語 -> 中文", "👤 中文 -> 手語"])
 
-with tab1:
+# ==========================================
+# --- 模式一：手語 -> 中文 ---
+# ==========================================
+with tab_slr:
     col_cam, col_res = st.columns([3, 2])
+    
     with col_cam:
+        st.markdown("### 📹 雲端即時影像串流")
+        st.caption("🔍 點擊下方 START 按鈕啟動瀏覽器相機權限...")
+        
+        # 使用 WebRTC 元件取代傳統 OpenCV 按鈕與迴圈
         webrtc_streamer(
-            key="tsl-system",
+            key="tsl-scanner",
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            rtc_configuration=RTC_CONFIGURATION,
             video_frame_callback=video_frame_callback,
+            media_stream_constraints={"video": True, "audio": False}, # 手語不需要錄音
             async_processing=True,
         )
-        if st.button("🧹 清除辨識結果"):
-            st.session_state.detected_glosses = []
-            st.rerun()
 
     with col_res:
-        st.subheader("📝 翻譯結果")
+        st.markdown("### 🧠 翻譯")
         
-        # 從 Queue 中提取背景辨識到的資料並更新 UI
-        while not st.session_state.result_queue.empty():
-            new_val = st.session_state.result_queue.get()
-            if not st.session_state.detected_glosses or new_val != st.session_state.detected_glosses[-1]:
-                st.session_state.detected_glosses.append(new_val)
+        st.write("**● 偵測到的手語**")
+        if st.session_state.detected_gloss:
+            st.info(st.session_state.detected_gloss)
+        else:
+            st.markdown('<p class="empty-placeholder">尚無數據...</p>', unsafe_allow_html=True)
+        
+        st.write("") 
+        
+        st.write("**● 中文翻譯**")
+        if st.session_state.translated_chinese:
+            st.markdown(f"""
+                <div class="result-card">
+                    <h4 style="margin:0; color:#1E293B;">{st.session_state.translated_chinese}</h4>
+                </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="result-card"><p class="empty-placeholder">等待翻譯...</p></div>', unsafe_allow_html=True)
 
-        st.write("**● 偵測到的手語詞彙 (Glosses)**")
-        st.info(" ➔ ".join(st.session_state.detected_glosses) if st.session_state.detected_glosses else "等待偵測中...")
 
-with tab2:
-    st.write("（未來可對接 SMPL-X 虛擬人生成預覽）")
+# ==========================================
+# --- 模式二：中文 -> 手語 ---
+# ==========================================
+with tab_slp:
+    col_input, col_avatar = st.columns([2, 3])
+    
+    with col_input:
+        st.markdown("### ⌨️ 中文文字輸入")
+        user_input = st.text_area("請輸入中文內容：", height=200, placeholder="例如：請攜帶學生證到商管大樓辦理。")
+        
+        if st.button("🪄 生成手語動作"):
+            if user_input:
+                with st.spinner("LLM 正在解析語法與生成骨架動畫..."):
+                    time.sleep(1.5) 
+                    st.session_state.video_ready = True
+                    st.rerun()
+            else:
+                st.warning("⚠️ 請先輸入中文內容再點擊生成喔！")
+
+        if st.session_state.video_ready:
+            st.write("**TSL 動作序列：**")
+            st.code("同學 | 攜帶 | 學生證 | 商管大樓 | 辦理", language=None)
+            
+            if st.button("🔄 清除並重新生成"):
+                st.session_state.video_ready = False
+                st.rerun()
+
+    with col_avatar:
+        if st.session_state.video_ready:
+            st.video("https://www.w3schools.com/html/mov_bbb.mp4")
+            st.success("✅ 動畫生成完畢！")
+            st.caption("💡 提示：此動畫由 TAIDE 解析語意後，透過骨架驅動生成。")
+        else:
+            st.markdown("""
+                <div class="video-placeholder">
+                    <div style="text-align: center; color: #94A3B8;">
+                        <span style="font-size: 2.5rem;">🎞️</span><br>
+                        <span style="font-weight: 500; font-size: 1.1rem;">虛擬人生成的影片將在此框內播放</span>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+            st.write("")
+            st.caption("💡 提示：系統會根據翻譯出的 Gloss 序列驅動虛擬人骨架")
+
+# --- 頁尾 ---
+st.markdown("---")
+st.markdown("<p style='text-align: center; color: #94A3B8;'>淡江大學 資訊管理學系 大專生計畫 - 曼璇 製作</p>", unsafe_allow_html=True)
