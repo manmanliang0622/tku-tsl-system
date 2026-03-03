@@ -4,6 +4,7 @@ import numpy as np
 import time
 import av
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import mediapipe as mp
 
 # 1. 頁面基礎設定
 st.set_page_config(
@@ -80,19 +81,40 @@ if 'translated_chinese' not in st.session_state:
 if 'video_ready' not in st.session_state:
     st.session_state.video_ready = False
 
-# 4. WebRTC 伺服器設定 (確保雲端連線穩定)
+# 4. 初始化 MediaPipe 與 WebRTC 設定
+mp_holistic = mp.solutions.holistic
+mp_drawing = mp.solutions.drawing_utils
+
+# 設定 Holistic 模型 (提取身體與雙手關鍵點)
+holistic = mp_holistic.Holistic(
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# WebRTC 伺服器設定 (確保雲端連線穩定)
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-# 影像處理回呼函式 (取代原本的 while 迴圈)
+# 影像處理回呼函式 (即時畫上骨架)
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+    # 轉換成 OpenCV 格式並翻轉
     img = frame.to_ndarray(format="bgr24")
-    
-    # 鏡像翻轉，比較符合使用者的直覺
     img = cv2.flip(img, 1)
     
-    # 💡 之後我們就在這裡把 MediaPipe 的骨架追蹤邏輯加進去！
+    # 轉換色彩空間供 MediaPipe 讀取
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # 進行骨架偵測
+    results = holistic.process(img_rgb)
+    
+    # 在影像上畫出骨架連線
+    if results.pose_landmarks:
+        mp_drawing.draw_landmarks(img, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
+    if results.left_hand_landmarks:
+        mp_drawing.draw_landmarks(img, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+    if results.right_hand_landmarks:
+        mp_drawing.draw_landmarks(img, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
     
     return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -115,15 +137,15 @@ with tab_slr:
     
     with col_cam:
         st.markdown("### 📹 雲端即時影像串流")
-        st.caption("🔍 點擊下方 START 按鈕啟動瀏覽器相機權限...")
+        st.caption("🔍 點擊下方 START 按鈕啟動瀏覽器相機並進行骨架偵測...")
         
-        # 使用 WebRTC 元件取代傳統 OpenCV 按鈕與迴圈
+        # WebRTC 視訊串流區塊
         webrtc_streamer(
             key="tsl-scanner",
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTC_CONFIGURATION,
             video_frame_callback=video_frame_callback,
-            media_stream_constraints={"video": True, "audio": False}, # 手語不需要錄音
+            media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
         )
 
@@ -147,7 +169,6 @@ with tab_slr:
             """, unsafe_allow_html=True)
         else:
             st.markdown('<div class="result-card"><p class="empty-placeholder">等待翻譯...</p></div>', unsafe_allow_html=True)
-
 
 # ==========================================
 # --- 模式二：中文 -> 手語 ---
@@ -178,6 +199,7 @@ with tab_slp:
 
     with col_avatar:
         if st.session_state.video_ready:
+            # 目前以測試動畫代替，未來可換成妳算繪好的虛擬人 MP4
             st.video("https://www.w3schools.com/html/mov_bbb.mp4")
             st.success("✅ 動畫生成完畢！")
             st.caption("💡 提示：此動畫由 TAIDE 解析語意後，透過骨架驅動生成。")
