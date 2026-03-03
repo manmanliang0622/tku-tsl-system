@@ -5,12 +5,16 @@ import av
 import os
 import torch
 import json
-import queue
+import queue # 用於解決執行緒安全通訊
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 import mediapipe as mp
 from dotenv import load_dotenv
 
-# 1. 環境與頁面基礎設定
+# 載入核心組件
+from core.data_loader import TSLModel 
+from core.tsl_smart_translator import translate_tsl_to_formal_chinese
+
+# 1. 頁面基礎設定
 load_dotenv()
 st.set_page_config(
     page_title="淡江大學 TSL 雙向手語轉譯系統",
@@ -18,107 +22,112 @@ st.set_page_config(
     layout="wide"
 )
 
-# 自動偵測 GPU (解決雲端無 GPU 會崩潰的問題)
+# 自動偵測設備，確保在雲端 CPU 環境也能執行
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 2. 共享狀態管理 (Thread-safe Queue)
-# 這是為了解決 WebRTC 背景處理與 Streamlit 主畫面通訊的關鍵
+# 2. 共享狀態管理：建立一個 Thread-safe 的佇列
 if "result_queue" not in st.session_state:
     st.session_state.result_queue = queue.Queue()
-if "detected_glosses" not in st.session_state:
+if 'detected_glosses' not in st.session_state:
     st.session_state.detected_glosses = []
-if "translated_chinese" not in st.session_state:
+if 'translated_chinese' not in st.session_state:
     st.session_state.translated_chinese = ""
 
-# 3. 載入模型與標籤 (使用快取避免重複載入)
+# 3. 資源載入 (使用快取)
 @st.cache_resource
-def load_resources():
-    # 載入標籤對照表
-    try:
-        with open('label_map.json', 'r', encoding='utf-8') as f:
-            l_map = json.load(f)
-        actions = {v: k for k, v in l_map.items()}
-    except:
-        actions = {0: "測試標籤"}
+def load_all_resources():
+    with open('label_map.json', 'r', encoding='utf-8') as f:
+        l_map = json.load(f)
+    actions_map = {v: k for k, v in l_map.items()}
+    
+    # 載入模型
+    model = TSLModel(input_size=126, hidden_size=128, num_layers=2, num_classes=len(actions_map))
+    if os.path.exists('models/tsl_model.pth'):
+        model.load_state_dict(torch.load('models/tsl_model.pth', map_location=device))
+    model.to(device).eval()
+    return model, actions_map
 
-    # 載入妳的 TSL 模型
-    # from core.data_loader import TSLModel
-    # model = TSLModel(...) 
-    # model.load_state_dict(torch.load('models/tsl_model.pth', map_location=device))
-    # model.eval().to(device)
-    return actions # , model
-
-actions = load_resources()
+tsl_ai_model, actions = load_all_resources()
 
 # 4. MediaPipe 初始化
 mp_holistic = mp.solutions.holistic
+mp_drawing = mp.solutions.drawing_utils
 holistic = mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-# 5. 影像處理回呼函數 (WebRTC 背景執行緒)
-def video_frame_callback(frame):
+# 用於儲存特徵序列的臨時 buffer
+sequence_buffer = []
+
+# WebRTC 影像處理回呼 (注意：此函數在獨立執行緒運行，不可直接存取 session_state)
+def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img = frame.to_ndarray(format="bgr24")
-    img = cv2.flip(img, 1) # 鏡像處理
+    img = cv2.flip(img, 1)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    
-    # MediaPipe 偵測
     results = holistic.process(img_rgb)
     
-    # 這裡實作妳的模型預測邏輯 (簡化示範)
-    # 辨識成功後，將結果推入 queue 而非 session_state
-    # example_action = "宿舍" 
-    # st.session_state.result_queue.put(example_action)
+    # 繪圖
+    if results.left_hand_landmarks:
+        mp_drawing.draw_landmarks(img, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+    if results.right_hand_landmarks:
+        mp_drawing.draw_landmarks(img, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+
+    # 提取特徵
+    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(63)
+    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(63)
+    keypoints = np.concatenate([lh, rh])
+
+    sequence_buffer.append(keypoints)
+    if len(sequence_buffer) > 30:
+        sequence_buffer.pop(0)
+
+    if len(sequence_buffer) == 30:
+        input_tensor = torch.FloatTensor(np.expand_dims(sequence_buffer, axis=0)).to(device)
+        with torch.no_grad():
+            res = tsl_ai_model(input_tensor)
+            prob = torch.softmax(res, dim=1)
+            max_prob, idx = torch.max(prob, dim=1)
+            
+            if max_prob.item() > 0.85:
+                # 關鍵：將結果放入 Queue，由主執行緒讀取更新 UI
+                st.session_state.result_queue.put(actions[idx.item()])
 
     return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# 6. UI 介面佈局
-st.title("🤟 淡江大學行政服務：台灣手語雙向轉譯系統")
-st.info("本系統已整合 Gemini 2.5 Flash 進行行政用語轉譯，並支援 SMPL-X 虛擬人動作封裝。")
+# --- UI 介面 ---
+st.title("🤟 淡江校園窗口：台灣手語雙譯系統")
 
-tab1, tab2 = st.tabs(["👋 手語辨識 (SLR)", "🤖 動作生成 (SLP)"])
+tab_slr, tab_slp = st.tabs(["👋 手語轉中文", "🤖 中文轉手語"])
 
-with tab1:
-    col_left, col_right = st.columns([2, 1])
-    
-    with col_left:
-        st.subheader("📸 鏡頭即時偵測")
+with tab_slr:
+    col_cam, col_res = st.columns([3, 2])
+    with col_cam:
         webrtc_streamer(
-            key="tsl-streamer",
+            key="tsl-scanner",
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTCConfiguration(
-                {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-            ),
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
             video_frame_callback=video_frame_callback,
-            media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
         )
+        if st.button("🧹 清除辨識結果"):
+            st.session_state.detected_glosses = []
+            st.session_state.translated_chinese = ""
+            st.rerun()
 
-    with col_right:
-        st.subheader("📝 辨識結果與翻譯")
+    with col_res:
+        st.subheader("📝 翻譯與轉譯結果")
         
-        # 從 Queue 中提取背景辨識到的資料
+        # 從 Queue 中提取背景偵測到的詞彙並更新 UI
         while not st.session_state.result_queue.empty():
-            val = st.session_state.result_queue.get()
-            if not st.session_state.detected_glosses or val != st.session_state.detected_glosses[-1]:
-                st.session_state.detected_glosses.append(val)
-                st.rerun() # 發現新詞彙時更新 UI
+            new_gloss = st.session_state.result_queue.get()
+            if not st.session_state.detected_glosses or new_gloss != st.session_state.detected_glosses[-1]:
+                st.session_state.detected_glosses.append(new_gloss)
+                # 自動觸發翻譯邏輯
+                st.session_state.translated_chinese = translate_tsl_to_formal_chinese(st.session_state.detected_glosses)
 
-        st.write("**● 偵測到的手語序列 (Glosses)**")
-        st.success(" ➔ ".join(st.session_state.detected_glosses) if st.session_state.detected_glosses else "等待偵測中...")
-
-        if st.button("🪄 進行行政用語轉譯"):
-            if st.session_state.detected_glosses:
-                with st.spinner("Gemini 正在轉譯中..."):
-                    # 串接妳的翻譯函數
-                    # st.session_state.translated_chinese = translate_tsl_to_formal_chinese(st.session_state.detected_glosses)
-                    st.session_state.translated_chinese = "您好，請問需要辦理宿舍申請嗎？" # 範例內容
-            else:
-                st.warning("目前無偵測數據")
-
-        st.write("**● 翻譯結果 (正式中文)**")
-        st.info(st.session_state.translated_chinese if st.session_state.translated_chinese else "尚未轉譯")
-
-with tab2:
-    st.subheader("🤖 虛擬人生成預覽 (SMPL-X Standard)")
-    input_text = st.text_input("輸入回覆內容：", placeholder="例如：補辦學生證需至行政大樓。")
-    if st.button("生成動作 JSON"):
-        st.json({"status": "success", "format": "SMPL-X", "data": "joints_rotation_data..."})
+        st.write("**● 偵測到的手語序列**")
+        st.info(" ➔ ".join(st.session_state.detected_glosses) if st.session_state.detected_glosses else "等待偵測...")
+        
+        st.write("**● 淡江行政回覆 (Gemini 轉譯)**")
+        if st.session_state.translated_chinese:
+            st.success(st.session_state.translated_chinese)
+        else:
+            st.markdown('<p style="color:gray;">等待 AI 組句...</p>', unsafe_allow_html=True)
