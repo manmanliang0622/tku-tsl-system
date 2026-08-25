@@ -353,6 +353,58 @@
     return { hands, pose, face };
   }
 
+  /* ── playback resampling ─────────────────────────────────────────────
+     A composed sentence runs at COMPOSE_FPS (30). The render loop runs at the
+     display's rate — 60, 120, 144Hz — so picking the nearest earlier frame
+     feeds the retarget a STAIRCASE: the same landmarks for two to five render
+     frames, then a step of a whole 30fps interval all at once.
+
+     That is a jitter source in its own right (the arm ratchets instead of
+     travelling), and it also breaks every per-frame RATE the retarget
+     measures — the palm gate's deg/s and the stroke-speed gate both divide by
+     the render dt, so on a held frame they read zero and on a step frame they
+     read the true rate times the refresh ratio. On a 120Hz display that is 4x,
+     which puts ordinary signing pronation above the gate's reject threshold.
+
+     Sampling ON the render clock fixes both: the retarget sees motion
+     proportional to its own dt, and the recording's 30Hz content is carried
+     by position interpolation rather than by the smoothing filters
+     downstream, which is what they were tuned to assume. */
+  function frameBetween(a, b, k) {
+    if (!b || k <= 0) return a;
+    if (k >= 1) return b;
+    const mix = (x, y) => x + (y - x) * k;
+    return {
+      ...blendFrame(a, b, k),
+      index: a.index,
+      timestamp: a.timestamp + (b.timestamp - a.timestamp) * k,
+      // the token label is what the timeline reads: a frame belongs to the
+      // sign it started in, so it must not flip halfway through a blend
+      _tok: a._tok,
+      _rest: mix(a._rest || 0, b._rest || 0),
+      _body: a._body && b._body
+        ? { width: mix(a._body.width, b._body.width), torso: mix(a._body.torso, b._body.torso) }
+        : (a._body || b._body || null),
+    };
+  }
+
+  /* the frame to show at time `t`, interpolated between the two that bracket it */
+  function sampleAt(frames, t) {
+    if (!frames || !frames.length) return null;
+    let lo = 0, hi = frames.length - 1;
+    while (lo < hi) {                       // first frame with timestamp >= t
+      const mid = (lo + hi) >> 1;
+      if (frames[mid].timestamp < t) lo = mid + 1;
+      else hi = mid;
+    }
+    const i = Math.max(0, lo - 1);
+    const a = frames[i], b = frames[i + 1];
+    if (!b) return a;
+    const span = b.timestamp - a.timestamp;
+    if (!(span > 1e-6)) return a;
+    return frameBetween(a, b, Math.min(1, Math.max(0, (t - a.timestamp) / span)));
+  }
+
   /* trim leading/trailing low-motion (neutral/idle) frames from a segment.
      Wrist speed in normalized image units/sec; a hand appearing or vanishing
      counts as activity so we never cut into the actual sign. Trim is capped
@@ -950,6 +1002,8 @@
     clipRequests,
     sliceSegment,
     blendFrame,
+    frameBetween,
+    sampleAt,
     blendSeconds,
     applyNMM,
     build,
