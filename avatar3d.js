@@ -92,7 +92,7 @@ const TUNE = { unmirror: true, fx: 1, fy: 1, fz: 1, swapSides: false, hipsYaw: 0
   /* live-tunable retarget gains, so they can be measured rather than guessed */
   fingerContrast: 0.55, fingerGap: 0.62, dipBand: 1, separate: 1,
   moveGain: 1.35, tauTarget: 0.055, tauArm: 0.040, twistSoft: 80, twistToHand: 35,
-  collide: 1, pairGeom: 1, palmTau: 0 };
+  collide: 1, pairGeom: 1, pairPush: 1, palmTau: 0 };
 
 const poseLm = (pts, vis, world) =>
   pts.map((p, j) => ({
@@ -611,6 +611,7 @@ function resetSmoothing() {
   for (const k of Object.keys(SMOOTH)) delete SMOOTH[k];
   for (const k of Object.keys(CORR)) delete CORR[k];
   for (const k of Object.keys(POLE_CORR)) delete POLE_CORR[k];
+  for (const k of Object.keys(PAIR_CORR)) delete PAIR_CORR[k];
   // joint state carried between frames: a stale roll would be applied to the
   // first frame of the next sign before its own hand solve replaces it
   for (const side of ["left", "right"]) {
@@ -808,6 +809,7 @@ function solveArm(side, poseWorld, visOK, handPresent, body = null, dt = 0.016, 
   // on 看 — that was the arm shaking. Folding it into the target means one
   // aim per frame and a correction that ramps instead of popping.
   const corr = CORR[side] || (CORR[side] = new THREE.Vector3());
+  const pair = PAIR_CORR[side] || (PAIR_CORR[side] = new THREE.Vector3());
   /* Where `rel` is measured from, and it differs between the two cases.
    *
    * While SIGNING the target is anchored on the rest shoulder, because sign
@@ -825,7 +827,7 @@ function solveArm(side, poseWorld, visOK, handPresent, body = null, dt = 0.016, 
    * inside the body. Blending the anchor by the rest weight gives each case
    * the frame it needs. */
   const anchor = BODY.shoulder[side].clone().lerp(S, restW);
-  const T = anchor.add(rel).add(corr);
+  const T = anchor.add(rel).add(corr).add(pair);
   const reach = T.clone().sub(S);
   if (reach.length() > maxReach) T.copy(S).add(reach.setLength(maxReach));
 
@@ -1039,6 +1041,7 @@ const FINGER_MIDS = ["ThumbProximal", "IndexIntermediate", "MiddleIntermediate",
 const FINGER_R = 0.009;   // ~9mm per finger, so a pair clears at 18mm
 const CORR = {};          // per side: smoothed collision offset, in avatar space
 const POLE_CORR = {};     // per side: elbow pole offset, for forearm contacts
+const PAIR_CORR = {};     // per side: hand-vs-hand offset, on its own budget
 const TAU_CORR = 0.09;    // how fast the correction ramps in and releases
 /* The correction is an integrator: each frame it adds whatever penetration
  * is left over. With a unit gain and no bound that winds up — measured on
@@ -1055,6 +1058,24 @@ const CORR_MAX = 0.07;    // metres
  * sign — it can only choose a different elbow. Sharing CORR's 7cm cap was
  * leaving the arm stuck in the chest with the correction already saturated. */
 const POLE_MAX = 0.09;    // metres
+/* The hand-vs-hand correction is kept on a separate, much smaller budget
+ * rather than sharing the body one, for two reasons.
+ *
+ * What it is aiming at is CONTACT, not clearance: two fingers that touch sit
+ * one finger-width apart centre to centre, which is exactly `min` below. So
+ * the offset it can legitimately need is a finger or two, never the 7cm the
+ * body constraint is allowed.
+ *
+ * And unlike a hand inside the torso, this constraint is not always
+ * satisfiable. Signs where the two hands genuinely cross or interlock —
+ * 保密 is "雙手食指伸直交叉放口前", crossed index fingers — have segments that
+ * really do intersect, and no wrist offset can separate them without
+ * destroying the sign. An integrator sharing the body budget would wind those
+ * apart by the full 7cm. Bounded here, the worst it can do is nudge.
+ *
+ * Set Avatar3D.tune.pairPush = 0 to switch the constraint off and compare. */
+const PAIR_MAX = 0.02;    // metres — about a finger's width and change
+const ZERO_V = new THREE.Vector3();
 const ARM_SAMPLES = 4;    // per segment
 const UPPER_FROM = 0.45;  // skip the humeral head, it belongs inside the shoulder
 const WRIST_TO = 0.85;    // the hand probes own the last stretch
@@ -1140,7 +1161,8 @@ function closestBetweenSegments(p1, q1, p2, q2) {
  * offset, which is then eased into CORR so the arm never jumps. */
 function updateCollisionCorrections(dt, restW = 0) {
   if (!TUNE.collide) { for (const k of Object.keys(CORR)) CORR[k].set(0, 0, 0);
-    for (const k of Object.keys(POLE_CORR)) POLE_CORR[k].set(0, 0, 0); return; }
+    for (const k of Object.keys(POLE_CORR)) POLE_CORR[k].set(0, 0, 0);
+    for (const k of Object.keys(PAIR_CORR)) PAIR_CORR[k].set(0, 0, 0); return; }
   const alpha = smoothAlpha(dt, TAU_CORR);
   const active = 1 - Math.min(1, Math.max(0, restW));
   const want = { left: new THREE.Vector3(), right: new THREE.Vector3() };
@@ -1235,7 +1257,21 @@ function updateCollisionCorrections(dt, restW = 0) {
   //
   // Only the deepest violation drives the push, and the two hands share it
   // symmetrically so neither is singled out.
-  if (ARM.left.lastT && ARM.right.lastT) {
+  //
+  // Like the two constraints above, this one INTEGRATES. handSegments() reads
+  // live bone positions, so the overlap measured here is whatever is left
+  // after the offset already in force — asking for the raw overlap alone
+  // subtracts the correction's own effect from its own target. Solving that
+  // loop: with both hands pushing, penetration p(x) = p0 - 2x and want =
+  // p(x)/2, so x settles at p0/4 and HALF the original interpenetration stays
+  // put no matter how long the contact lasts. That is the 1.5-1.6cm plateau
+  // the old per-joint test reported, reproduced by the controller rather than
+  // by the geometry. Carrying the offset in force into the target converges
+  // on contact instead.
+  const wantPair = { left: new THREE.Vector3(), right: new THREE.Vector3() };
+  for (const side of ["left", "right"]) PAIR_CORR[side] ||= new THREE.Vector3();
+  let touching = false;
+  if (ARM.left.lastT && ARM.right.lastT && TUNE.pairPush) {
     const L = handSegments("left"), R = handSegments("right");
     const min = FINGER_R * 2;
     let worst = null, overlap = 0;
@@ -1247,18 +1283,25 @@ function updateCollisionCorrections(dt, restW = 0) {
       }
     }
     if (worst) {
-      const half = worst.multiplyScalar(overlap / 2);
-      want.right.add(half);
-      want.left.sub(half);
+      // damped by the same gain the body constraints use, for the same reason:
+      // the probe lags the correction by a frame, so asking for all of it
+      // overshoots
+      const half = worst.multiplyScalar(overlap / 2 * CORR_GAIN * TUNE.pairPush);
+      wantPair.right.copy(PAIR_CORR.right).add(half);
+      wantPair.left.copy(PAIR_CORR.left).sub(half);
+      touching = true;
     }
   }
 
-  // ease toward the wanted offset; when nothing collides `want` is zero, so
-  // the correction relaxes back out on its own
+  // ease toward the wanted offsets; when nothing collides `want` is zero, so
+  // each correction relaxes back out on its own
   for (const side of ["left", "right"]) {
     const corr = CORR[side] || (CORR[side] = new THREE.Vector3());
     corr.lerp(want[side].multiplyScalar(active), alpha);
     if (corr.length() > CORR_MAX) corr.setLength(CORR_MAX);  // anti-windup
+    const pc = PAIR_CORR[side];
+    pc.lerp(touching ? wantPair[side].multiplyScalar(active) : ZERO_V, alpha);
+    if (pc.length() > PAIR_MAX) pc.setLength(PAIR_MAX);
   }
 }
 
@@ -2409,7 +2452,7 @@ window.Avatar3D = {
   get vrm() { return vrm; },  // console calibration: expressions, bones, morphs
   get volumes() { return VOL; },
   get limbs() { return LIMB; },
-  get corrections() { return { wrist: CORR, pole: POLE_CORR }; },
+  get corrections() { return { wrist: CORR, pole: POLE_CORR, pair: PAIR_CORR }; },
   get jointStats() { return JOINT_STATS; },
   get arms() { return ARM; },   // diagnostics: per-arm solver state
   get body() { return BODY; },   // diagnostics: mapping basis
