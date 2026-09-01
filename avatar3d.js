@@ -92,7 +92,11 @@ const TUNE = { unmirror: true, fx: 1, fy: 1, fz: 1, swapSides: false, hipsYaw: 0
   /* live-tunable retarget gains, so they can be measured rather than guessed */
   fingerContrast: 0.55, fingerGap: 0.62, dipBand: 1, separate: 1,
   moveGain: 1.35, tauTarget: 0.055, tauArm: 0.040, twistSoft: 80, twistToHand: 35,
-  collide: 1, pairGeom: 1, palmTau: 0 };
+  collide: 1, pairGeom: 1, palmTau: 0,
+  /* literal, not LOW_HAND_REACH_ENTER: this object is built long before that
+   * constant exists, and naming it here would be a temporal-dead-zone crash
+   * at load. Keep the two in step. */
+  lowReach: 0.50 };
 
 const poseLm = (pts, vis, world) =>
   pts.map((p, j) => ({
@@ -1741,6 +1745,30 @@ const TAU_HAND_RELAX = 0.25;
  * at the boundary does not flicker between the two regimes. */
 const LOW_HAND_ENTER = 0.28;
 const LOW_HAND_LEAVE = 0.42;
+/* ...but height alone mistakes a LOW SIGN for a lowered hand ─────────
+ * 行李 is signed with both fists at hip height, as if gripping two suitcase
+ * handles (corpus G3C25_R 27.4-27.9). Wrist height there is ~0 of the
+ * hip→shoulder span, far under LOW_HAND_ENTER, so the whole hand solve was
+ * skipped and the two fists — which ARE the sign — relaxed to a neutral open
+ * hand. At least 50 lexicon entries describe signs at waist, belly or thigh
+ * height (敢, 壓, 付帳, 吃飽了, 口袋_A, 洗澡_B …); the corpus fragments carry no
+ * description, so the true count is higher.
+ *
+ * What separates the two is not height but WHERE: an arm that hangs has its
+ * wrist tucked in beside its own hip, while a sign held low is out in front
+ * of the body. So the relax now needs both — low AND close in. The test is a
+ * strict AND, so it can only ever rescue hands the old rule was already
+ * relaxing; it cannot start trusting a hand that used to be trusted.
+ *
+ * The threshold is a FIRST ESTIMATE, not a measurement — it wants the
+ * horizontal wrist-to-hip distance of a hanging arm, which needs landmark
+ * data this machine cannot produce. Both quantities are logged to
+ * Avatar3D.jointHist ("wrist:lowH", "wrist:lowReach") so one playback of a
+ * low sign next to one of a sentence ending at rest gives the two
+ * distributions to set it from. Avatar3D.tune.lowReach = 0 restores the
+ * height-only rule. */
+const LOW_HAND_REACH_ENTER = 0.50;   // hip→wrist horizontal, in torso lengths
+const LOW_HAND_REACH_LEAVE = 0.62;
 /* palm-target angular-rate limits, deg/s: fastest measured real signing
  * pronation runs ~600; tracking garbage runs 1500+ */
 const PALM_RATE_MAX = 700;
@@ -2312,13 +2340,22 @@ function update(frame, dt) {
         hip = lm[side === "left" ? 23 : 24];
       const span = hip[1] - sho[1];
       const h = span > 1e-6 ? (hip[1] - wri[1]) / span : 1;
+      // how far the wrist sits from its own hip in the horizontal plane,
+      // in the same torso lengths — small for an arm that hangs, large for a
+      // sign held low but forward
+      const reach = span > 1e-6
+        ? Math.hypot(wri[0] - hip[0], wri[2] - hip[2]) / span : 0;
+      if (h < LOW_HAND_LEAVE) { noteVal("wrist:lowH", h); noteVal("wrist:lowReach", reach); }
+      const near = !(TUNE.lowReach > 0) ? true
+        : arm.wristLow ? reach < TUNE.lowReach * (LOW_HAND_REACH_LEAVE / LOW_HAND_REACH_ENTER)
+                       : reach < TUNE.lowReach;
       /* Absolute height only. A drop-from-recent-peak detector was tried here
        * to catch the hand EARLIER on its way down — and it relaxed live signs
        * instead: ordinary downward strokes (謝謝's bow, 不會's press) fall just
        * as far below their own peak as a retraction does, and finger error
        * doubled. Below 0.28 of the hip→shoulder span nothing linguistic
        * happens in this corpus; above it, follow the data. */
-      arm.wristLow = arm.wristLow ? h < LOW_HAND_LEAVE : h < LOW_HAND_ENTER;
+      arm.wristLow = near && (arm.wristLow ? h < LOW_HAND_LEAVE : h < LOW_HAND_ENTER);
     }
   }
   const seen = new Set();
