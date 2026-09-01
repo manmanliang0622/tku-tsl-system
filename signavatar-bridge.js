@@ -414,17 +414,11 @@ function attachScrub() {
   });
 }
 
+/* Resampled onto the render clock, not the nearest earlier frame: see
+   Composer.sampleAt for why the staircase mattered. */
 function frameAt(t) {
   if (!composed?.frames?.length) return null;
-  const frames = composed.frames;
-  let lo = 0;
-  let hi = frames.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (frames[mid].timestamp < t) lo = mid + 1;
-    else hi = mid;
-  }
-  return frames[Math.max(0, lo - 1)];
+  return Composer.sampleAt(composed.frames, t);
 }
 
 function resizeStage() {
