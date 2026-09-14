@@ -2097,13 +2097,6 @@ function rigHand(side, handLms, worldLms, dt = 0.016) {
       handWorld = arm.palmSmoothQ.clone();
     } else {
       arm.palmSmoothQ = null;
-    arm.wristLow = false;
-    arm.prevWristH = null;
-
-    arm.lastPalmQ = null;
-    arm.palmBad = 0;
-    arm.prevRel = null;
-    arm.relSpeedS = null;
     }
 
     // Decompose against the ROLL-FREE forearm aim, not against wherever the
@@ -2322,12 +2315,25 @@ function update(frame, dt) {
     }
   }
   const seen = new Set();
+  const solved = new Set();   // rigHand actually ran, whatever it then decided
   for (const h of frame.hands || []) {
     const side = h.handedness.toLowerCase();
     if (ARM[side] && ARM[side].wristLow) continue;   // hanging: data untrustworthy
+    solved.add(side);
     if (rigHand(h.handedness, handLm(h.landmarks), h.world_landmarks, step)) seen.add(side);
   }
-  for (const side of ["left", "right"]) if (!seen.has(side)) relaxFingers(side, step);
+  for (const side of ["left", "right"]) {
+    if (seen.has(side)) continue;
+    relaxFingers(side, step);
+    /* The palm gate is a per-frame rate limit, so it needs the PREVIOUS frame
+     * to measure against. Where the hand was not solved at all — undetected,
+     * or hanging low — the gap is not one frame, and whatever orientation the
+     * hand comes back with would read as an impossible jump and be thrown out
+     * exactly when it should be picked up. Frames the gate ITSELF rejected
+     * keep their history, so a run of garbage still escalates to relax. */
+    const arm = ARM[side];
+    if (arm && !solved.has(side)) { arm.lastPalmQ = null; arm.palmBad = 0; }
+  }
   // a hanging arm also has a neutral wrist, not the last sign's palm angle
   for (const side of ["left", "right"]) {
     const arm = ARM[side];

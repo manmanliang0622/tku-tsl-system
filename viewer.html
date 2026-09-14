@@ -450,8 +450,8 @@
 <script type="importmap">
 { "imports": { "three": "./vendor/three.module.js" } }
 </script>
-<script type="module" src="avatar3d.js?v=20260818-compound1"></script>
-<script src="composer.js?v=20260818-compound1"></script>
+<script type="module" src="avatar3d.js?v=20260823-jitter1"></script>
+<script src="composer.js?v=20260823-jitter1"></script>
 <script>
 "use strict";
 
@@ -910,7 +910,14 @@ function render(now) {
     // 3D rigged avatar takes over the stage; 2D canvas stays as event layer
     window.Avatar3D.resize(w * dpr, h * dpr);
     window.Avatar3D.setCamera(camera);
-    window.Avatar3D.update(rawFrames[i], dt);
+    // interpolated onto the render clock, exactly as generate.html plays it —
+    // calibrating against a 30fps staircase here would not match playback
+    window.Avatar3D.update(
+      window.Composer
+        ? window.Composer.frameBetween(rawFrames[i], rawFrames[i + 1], mix)
+        : rawFrames[i],
+      dt,
+    );
     window.Avatar3D.render();
   } else {
     const proj = makeProjector(w, h);

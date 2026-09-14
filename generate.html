@@ -210,9 +210,9 @@
 <script type="importmap">
 { "imports": { "three": "./vendor/three.module.js" } }
 </script>
-<script type="module" src="avatar3d.js?v=20260818-compound1"></script>
+<script type="module" src="avatar3d.js?v=20260823-jitter1"></script>
 <script src="signavatar-config.js"></script>
-<script src="composer.js?v=20260818-compound1"></script>
+<script src="composer.js?v=20260823-jitter1"></script>
 <script>
 "use strict";
 
@@ -266,15 +266,9 @@ async function loadModels() {
 }
 
 /* ── playback loop ──────────────────────────────────── */
-function frameAt(t) {
-  const frames = composed.frames;
-  let lo = 0, hi = frames.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1;
-    if (frames[mid].timestamp <= t) lo = mid; else hi = mid - 1;
-  }
-  return frames[lo];
-}
+/* Resampled onto the render clock rather than snapped to the nearest earlier
+   frame: see Composer.sampleAt for why the 30fps staircase mattered. */
+const frameAt = t => Composer.sampleAt(composed.frames, t);
 
 let lastTick = null;
 function tick(now) {
